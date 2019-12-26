@@ -15,7 +15,6 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/errdefs"
 	"github.com/pkg/errors"
 )
 
@@ -29,12 +28,12 @@ type serverResponse struct {
 
 // head sends an http request to the docker API using the method HEAD.
 func (cli *Client) head(ctx context.Context, path string, query url.Values, headers map[string][]string) (serverResponse, error) {
-	return cli.sendRequest(ctx, http.MethodHead, path, query, nil, headers)
+	return cli.sendRequest(ctx, "HEAD", path, query, nil, headers)
 }
 
 // get sends an http request to the docker API using the method GET with a specific Go context.
 func (cli *Client) get(ctx context.Context, path string, query url.Values, headers map[string][]string) (serverResponse, error) {
-	return cli.sendRequest(ctx, http.MethodGet, path, query, nil, headers)
+	return cli.sendRequest(ctx, "GET", path, query, nil, headers)
 }
 
 // post sends an http request to the docker API using the method POST with a specific Go context.
@@ -43,21 +42,30 @@ func (cli *Client) post(ctx context.Context, path string, query url.Values, obj 
 	if err != nil {
 		return serverResponse{}, err
 	}
-	return cli.sendRequest(ctx, http.MethodPost, path, query, body, headers)
+	return cli.sendRequest(ctx, "POST", path, query, body, headers)
 }
 
 func (cli *Client) postRaw(ctx context.Context, path string, query url.Values, body io.Reader, headers map[string][]string) (serverResponse, error) {
-	return cli.sendRequest(ctx, http.MethodPost, path, query, body, headers)
+	return cli.sendRequest(ctx, "POST", path, query, body, headers)
+}
+
+// put sends an http request to the docker API using the method PUT.
+func (cli *Client) put(ctx context.Context, path string, query url.Values, obj interface{}, headers map[string][]string) (serverResponse, error) {
+	body, headers, err := encodeBody(obj, headers)
+	if err != nil {
+		return serverResponse{}, err
+	}
+	return cli.sendRequest(ctx, "PUT", path, query, body, headers)
 }
 
 // putRaw sends an http request to the docker API using the method PUT.
 func (cli *Client) putRaw(ctx context.Context, path string, query url.Values, body io.Reader, headers map[string][]string) (serverResponse, error) {
-	return cli.sendRequest(ctx, http.MethodPut, path, query, body, headers)
+	return cli.sendRequest(ctx, "PUT", path, query, body, headers)
 }
 
 // delete sends an http request to the docker API using the method DELETE.
 func (cli *Client) delete(ctx context.Context, path string, query url.Values, headers map[string][]string) (serverResponse, error) {
-	return cli.sendRequest(ctx, http.MethodDelete, path, query, nil, headers)
+	return cli.sendRequest(ctx, "DELETE", path, query, nil, headers)
 }
 
 type headers map[string][]string
@@ -79,7 +87,7 @@ func encodeBody(obj interface{}, headers headers) (io.Reader, headers, error) {
 }
 
 func (cli *Client) buildRequest(method, path string, body io.Reader, headers headers) (*http.Request, error) {
-	expectedPayload := (method == http.MethodPost || method == http.MethodPut)
+	expectedPayload := (method == "POST" || method == "PUT")
 	if expectedPayload && body == nil {
 		body = bytes.NewReader([]byte{})
 	}
@@ -106,16 +114,15 @@ func (cli *Client) buildRequest(method, path string, body io.Reader, headers hea
 }
 
 func (cli *Client) sendRequest(ctx context.Context, method, path string, query url.Values, body io.Reader, headers headers) (serverResponse, error) {
-	req, err := cli.buildRequest(method, cli.getAPIPath(ctx, path, query), body, headers)
+	req, err := cli.buildRequest(method, cli.getAPIPath(path, query), body, headers)
 	if err != nil {
 		return serverResponse{}, err
 	}
 	resp, err := cli.doRequest(ctx, req)
 	if err != nil {
-		return resp, errdefs.FromStatusCode(err, resp.statusCode)
+		return resp, err
 	}
-	err = cli.checkResponseErr(resp)
-	return resp, errdefs.FromStatusCode(err, resp.statusCode)
+	return resp, cli.checkResponseErr(resp)
 }
 
 func (cli *Client) doRequest(ctx context.Context, req *http.Request) (serverResponse, error) {
@@ -169,13 +176,7 @@ func (cli *Client) doRequest(ctx context.Context, req *http.Request) (serverResp
 		// this is localised - for example in French the error would be
 		// `open //./pipe/docker_engine: Le fichier spécifié est introuvable.`
 		if strings.Contains(err.Error(), `open //./pipe/docker_engine`) {
-			// Checks if client is running with elevated privileges
-			if f, elevatedErr := os.Open("\\\\.\\PHYSICALDRIVE0"); elevatedErr == nil {
-				err = errors.Wrap(err, "In the default daemon configuration on Windows, the docker client must be run with elevated privileges to connect.")
-			} else {
-				f.Close()
-				err = errors.Wrap(err, "This error may indicate that the docker daemon is not running.")
-			}
+			err = errors.New(err.Error() + " In the default daemon configuration on Windows, the docker client must be run elevated to connect. This error may also indicate that the docker daemon is not running.")
 		}
 
 		return serverResp, errors.Wrap(err, "error during connect")
@@ -194,21 +195,17 @@ func (cli *Client) checkResponseErr(serverResp serverResponse) error {
 		return nil
 	}
 
-	var body []byte
-	var err error
-	if serverResp.body != nil {
-		bodyMax := 1 * 1024 * 1024 // 1 MiB
-		bodyR := &io.LimitedReader{
-			R: serverResp.body,
-			N: int64(bodyMax),
-		}
-		body, err = ioutil.ReadAll(bodyR)
-		if err != nil {
-			return err
-		}
-		if bodyR.N == 0 {
-			return fmt.Errorf("request returned %s with a message (> %d bytes) for API route and version %s, check if the server supports the requested API version", http.StatusText(serverResp.statusCode), bodyMax, serverResp.reqURL)
-		}
+	bodyMax := 1 * 1024 * 1024 // 1 MiB
+	bodyR := &io.LimitedReader{
+		R: serverResp.body,
+		N: int64(bodyMax),
+	}
+	body, err := ioutil.ReadAll(bodyR)
+	if err != nil {
+		return err
+	}
+	if bodyR.N == 0 {
+		return fmt.Errorf("request returned %s with a message (> %d bytes) for API route and version %s, check if the server supports the requested API version", http.StatusText(serverResp.statusCode), bodyMax, serverResp.reqURL)
 	}
 	if len(body) == 0 {
 		return fmt.Errorf("request returned %s for API route and version %s, check if the server supports the requested API version", http.StatusText(serverResp.statusCode), serverResp.reqURL)
